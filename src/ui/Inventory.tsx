@@ -11,7 +11,13 @@ import { capture } from './TouchControls';
  * - 点按快捷栏格 → 选中该格
  */
 
+const HOLD_TO_DRAG_MS = 220;
+
 interface Drag {
+  /** pending：尚未判定；drag：拖拽物品；scroll：在网格上滑动滚动（触屏） */
+  mode: 'pending' | 'drag' | 'scroll';
+  t0: number;
+  touch: boolean;
   from: 'grid' | 'bar';
   id: number;
   slot: number;
@@ -20,7 +26,6 @@ interface Drag {
   sy: number;
   x: number;
   y: number;
-  active: boolean;
 }
 
 export function Inventory() {
@@ -38,6 +43,7 @@ export function Inventory() {
   const [flash, setFlash] = useState<{ slot: number; k: number } | null>(null);
   const [hover, setHover] = useState<number | null>(null);
   const dragRef = useRef<Drag | null>(null);
+  const gridRef = useRef<HTMLDivElement>(null);
   dragRef.current = drag;
 
   useEffect(() => {
@@ -56,14 +62,25 @@ export function Inventory() {
     e.preventDefault();
     e.stopPropagation();
     capture(e);
-    setDrag({ from, id, slot: s, pid: e.pointerId, sx: e.clientX, sy: e.clientY, x: e.clientX, y: e.clientY, active: false });
+    const d: Drag = { mode: 'pending', t0: e.timeStamp, touch: e.pointerType !== 'mouse', from, id, slot: s, pid: e.pointerId, sx: e.clientX, sy: e.clientY, x: e.clientX, y: e.clientY };
+    dragRef.current = d;
+    setDrag(d);
   };
   const move = (e: React.PointerEvent) => {
     const d = dragRef.current;
     if (!d || d.pid !== e.pointerId) return;
-    const active = d.active || Math.hypot(e.clientX - d.sx, e.clientY - d.sy) > 8;
-    setDrag({ ...d, x: e.clientX, y: e.clientY, active });
-    if (active) {
+    let mode = d.mode;
+    const dx = e.clientX - d.sx, dy = e.clientY - d.sy;
+    if (mode === 'pending' && Math.hypot(dx, dy) > 8) {
+      // 触屏：快速竖向滑动 = 滚动网格；长按后移动 / 横向移动 = 拖拽物品
+      if (!d.touch || d.from === 'bar' || e.timeStamp - d.t0 >= HOLD_TO_DRAG_MS) mode = 'drag';
+      else mode = Math.abs(dy) > Math.abs(dx) ? 'scroll' : 'drag';
+    }
+    if (mode === 'scroll' && gridRef.current) gridRef.current.scrollTop -= e.clientY - d.y;
+    const nd = { ...d, x: e.clientX, y: e.clientY, mode };
+    dragRef.current = nd;
+    setDrag(nd);
+    if (mode === 'drag') {
       const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
       const t = el?.closest('[data-inv-slot]') as HTMLElement | null;
       setHover(t ? Number(t.dataset.invSlot) : null);
@@ -74,7 +91,9 @@ export function Inventory() {
     if (!d || d.pid !== e.pointerId) return;
     setDrag(null);
     setHover(null);
-    if (!d.active) {
+    dragRef.current = null;
+    if (d.mode === 'scroll') return;
+    if (d.mode === 'pending') {
       // 点按
       if (d.from === 'grid') put(slot, d.id);
       else setSlot(d.slot);
@@ -118,7 +137,7 @@ export function Inventory() {
               </button>
             ))}
           </div>
-          <div className="inv-grid-wrap">
+          <div className="inv-grid-wrap" ref={gridRef}>
             <div className="inv-cat-name">{CATEGORIES.find((c) => c.id === cat)?.nameZh} · {list.length} 种</div>
             <div className="inv-grid">
               {list.map((b) => (
@@ -152,7 +171,7 @@ export function Inventory() {
           ))}
         </div>
       </div>
-      {drag?.active && (
+      {drag?.mode === 'drag' && (
         <img className="inv-ghost" src={icon(drag.id, 64)} alt="" style={{ transform: `translate(${drag.x - 28}px, ${drag.y - 28}px)` }} />
       )}
     </div>

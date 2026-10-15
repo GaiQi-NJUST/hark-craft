@@ -498,7 +498,7 @@ function plant(kind: 'red' | 'yellow' | 'grass') {
 void W2;
 
 export const TILES: Record<TileName, TileSpec> = {
-  grass_top: { paint: grassTop, normal: 2.2, pixel: 0.06 },
+  grass_top: { paint: grassTop, normal: 1.5, pixel: 0.06 },
   grass_side: { paint: grassSide, normal: 2.6, pixel: 0.06 },
   dirt: { paint: dirt, normal: 2.6, pixel: 0.07 },
   stone: { paint: stone, normal: 3.0, pixel: 0.05 },
