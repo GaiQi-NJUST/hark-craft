@@ -60,7 +60,8 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
-      - uses: android-actions/setup-android@v3
+      - name: Android SDK (preinstalled on runner)
+        run: echo "ANDROID_HOME=$ANDROID_HOME"; ls "$ANDROID_HOME/build-tools" "$ANDROID_HOME/platforms"
       - run: npx cap sync android
       - name: assembleDebug
         working-directory: android
