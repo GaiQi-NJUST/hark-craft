@@ -1,0 +1,88 @@
+name: Build & Deploy (Pages + Android APK)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  web:
+    name: Build web (dist)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+        continue-on-error: true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  pages:
+    name: Deploy GitHub Pages
+    needs: web
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@v3
+      - run: npx cap sync android
+      - name: assembleDebug
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+      - name: Collect APK
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk HarkCraft.apk
+          ls -l HarkCraft.apk
+          "$ANDROID_HOME"/build-tools/*/aapt dump badging HarkCraft.apk | head -20 || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HarkCraft-apk
+          path: HarkCraft.apk
+      - name: Publish Release v1.0.0
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: HARK CRAFT v1.0.0
+          body: |
+            HARK CRAFT 安卓版（调试签名，可直接安装）。
+            下载 HarkCraft.apk，在手机上允许"安装未知来源应用"后安装即可。横屏全屏运行，支持触屏操作。
+          files: HarkCraft.apk
+          make_latest: true

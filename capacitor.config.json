@@ -1,0 +1,8 @@
+{
+  "appId": "com.hark.craft",
+  "appName": "HARK CRAFT",
+  "webDir": "dist",
+  "android": {
+    "backgroundColor": "#0b0d12"
+  }
+}
