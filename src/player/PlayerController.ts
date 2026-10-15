@@ -25,6 +25,8 @@ export class PlayerController {
   onGround = false;
   inWater = false;
   sprinting = false;
+  sneaking = false;
+  private eyeDrop = 0;
   private bob = 0;
   private fovKick = 0;
   sensitivity = 0.0023;
@@ -85,10 +87,13 @@ export class PlayerController {
     const wishX = fx * cos - fz * sin;
     const wishZ = -fx * sin - fz * cos;
 
-    const jump = active && (input.isDown('Space') || input.touchJump);
+    const jump = active && (input.isDown('Space') || input.touchJump || (this.flying && input.touchFlyUp));
     const shift = active && (input.isDown('ShiftLeft') || input.isDown('ShiftRight'));
     const ctrl = active && (input.isDown('ControlLeft') || input.isDown('KeyC'));
-    this.sprinting = (shift && !this.flying) || (input.touchSprint && len > 0.5);
+    const down = shift || (active && input.touchFlyDown);
+    // 潜行：Ctrl / 触屏潜行键；潜行时减速且不会从方块边缘掉落
+    this.sneaking = active && !this.flying && (input.touchSneak || input.isDown('ControlLeft'));
+    this.sprinting = !this.sneaking && ((shift && !this.flying) || (input.touchSprint && len > 0.5));
     if (len < 0.1) this.sprinting = false;
 
     const feet = world.getBlock(Math.floor(this.position.x), Math.floor(this.position.y + 0.2), Math.floor(this.position.z));
@@ -100,10 +105,11 @@ export class PlayerController {
       const k = 1 - Math.exp(-8 * dt);
       this.velocity.x += (wishX * sp - this.velocity.x) * k;
       this.velocity.z += (wishZ * sp - this.velocity.z) * k;
-      const vy = (jump ? 1 : 0) - (shift ? 1 : 0);
+      const vy = (jump ? 1 : 0) - (down ? 1 : 0);
       this.velocity.y += (vy * sp * 0.8 - this.velocity.y) * k;
     } else {
       let sp = this.sprinting ? SPRINT : WALK;
+      if (this.sneaking) sp *= 0.32;
       if (this.inWater) sp *= 0.55;
       const k = 1 - Math.exp(-(this.onGround ? 14 : this.inWater ? 6 : 3.2) * dt);
       this.velocity.x += (wishX * sp - this.velocity.x) * k;
@@ -125,7 +131,9 @@ export class PlayerController {
     // 分轴移动 + 子步
     const steps = Math.ceil(Math.max(Math.abs(this.velocity.x), Math.abs(this.velocity.y), Math.abs(this.velocity.z)) * dt / 0.35) || 1;
     const sdt = dt / steps;
+    const grounded = this.onGround;
     this.onGround = false;
+    this.edgeGuard = this.sneaking && grounded;
     for (let i = 0; i < steps; i++) {
       this.moveAxis(world, 1, this.velocity.y * sdt);
       this.moveAxis(world, 0, this.velocity.x * sdt);
@@ -146,7 +154,8 @@ export class PlayerController {
   private applyCamera(camera: THREE.PerspectiveCamera, dt: number, hspeed: number) {
     this.bob += hspeed * dt * 1.9;
     const bobAmp = Math.min(1, hspeed / WALK) * 0.045;
-    camera.position.set(this.position.x, this.position.y + EYE + Math.abs(Math.sin(this.bob * Math.PI)) * bobAmp, this.position.z);
+    this.eyeDrop += ((this.sneaking ? 0.22 : 0) - this.eyeDrop) * (1 - Math.exp(-12 * dt));
+    camera.position.set(this.position.x, this.position.y + EYE - this.eyeDrop + Math.abs(Math.sin(this.bob * Math.PI)) * bobAmp, this.position.z);
     camera.rotation.order = 'YXZ';
     camera.rotation.set(this.pitch, this.yaw, Math.sin(this.bob * Math.PI) * bobAmp * 0.08);
     const targetKick = this.sprinting ? 8 : this.flying && hspeed > 12 ? 10 : 0;
@@ -158,9 +167,31 @@ export class PlayerController {
     }
   }
 
+  private edgeGuard = false;
+
+  /** AABB 脚下是否有支撑 */
+  private supported(world: World) {
+    const p = this.position;
+    const y = Math.floor(p.y - 0.05);
+    const x0 = Math.floor(p.x - HALF_W), x1 = Math.floor(p.x + HALF_W - 1e-6);
+    const z0 = Math.floor(p.z - HALF_W), z1 = Math.floor(p.z + HALF_W - 1e-6);
+    for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) if (world.isSolid(x, y, z)) return true;
+    return false;
+  }
+
   private moveAxis(world: World, axis: 0 | 1 | 2, d: number) {
     if (d === 0) return;
     const p = this.position;
+    if (this.edgeGuard && axis !== 1) {
+      // 潜行防坠落：横向移动后若脚下悬空则撤销
+      if (axis === 0) p.x += d; else p.z += d;
+      const ok = this.supported(world);
+      if (axis === 0) p.x -= d; else p.z -= d;
+      if (!ok) {
+        if (axis === 0) this.velocity.x = 0; else this.velocity.z = 0;
+        return;
+      }
+    }
     if (axis === 0) p.x += d;
     else if (axis === 1) p.y += d;
     else p.z += d;

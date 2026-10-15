@@ -21,7 +21,16 @@ export class Input {
   touchBreak = false;
   touchPlace = false;
   touchSprint = false;
+  /** 正在用手指拖动视角（灵敏度倍增） */
   touchDown = false;
+  /** 潜行（触屏切换 / 桌面 Ctrl） */
+  touchSneak = false;
+  touchFlyUp = false;
+  touchFlyDown = false;
+  /** 点击交互模式：手指所指的屏幕点（NDC），null = 使用屏幕中心准星 */
+  aim: { x: number; y: number } | null = null;
+  /** 手指仍按在屏幕上（点击交互模式下显示选中描边） */
+  aimActive = false;
 
   onKey: ((code: string, e: KeyboardEvent) => void) | null = null;
   onUnlock: (() => void) | null = null;

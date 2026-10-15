@@ -42,7 +42,7 @@ export function TitleScreen({ engine }: { engine: Engine | null }) {
         </div>
       </div>
       <div className="corner-credit">Made by Hark</div>
-      <div className="corner-version">v1.0 · 体素沙盒</div>
+      <div className="corner-version">v1.1 · 体素沙盒</div>
     </div>
   );
 }

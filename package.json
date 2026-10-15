@@ -1,7 +1,7 @@
 {
   "name": "hark-craft",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "HARK CRAFT — Minecraft 风格体素沙盒（Vite + React 18 + TypeScript + three.js）",
   "scripts": {

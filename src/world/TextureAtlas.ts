@@ -1,5 +1,9 @@
 import * as THREE from 'three';
-import { BLOCKS, type TileName } from './Blocks';
+/** 旧版 16x 手绘像素贴图（仅用于开场动画与 Logo；游戏世界使用 BlockTextures 的 PBR 纹理数组） */
+type TileName =
+  | 'grass_top' | 'grass_side' | 'dirt' | 'stone' | 'sand' | 'log_side' | 'log_top'
+  | 'planks' | 'glass' | 'glowstone' | 'snow' | 'leaves' | 'water' | 'flower_red'
+  | 'flower_yellow' | 'tall_grass' | 'bedrock' | 'gold' | 'gravel';
 
 /**
  * 程序化 16x16 像素风贴图图集（Canvas 生成，无外部图片）。
@@ -200,7 +204,6 @@ export class TextureAtlas {
   private uvs = new Map<TileName, TileUV>();
   private pos = new Map<TileName, [number, number]>();
   private avg = new Map<TileName, THREE.Color>();
-  private iconCache = new Map<number, string>();
 
   constructor() {
     this.canvas = document.createElement('canvas');
@@ -252,59 +255,21 @@ export class TextureAtlas {
     this.texture.needsUpdate = true;
   }
 
-  uv(name: TileName): TileUV {
-    return this.uvs.get(name)!;
+  uv(name: string): TileUV {
+    return this.uvs.get(name as TileName) ?? this.uvs.get('stone')!;
   }
 
-  averageColor(name: TileName): THREE.Color {
-    return this.avg.get(name)!.clone();
+  averageColor(name: string): THREE.Color {
+    return (this.avg.get(name as TileName) ?? this.avg.get('stone')!).clone();
   }
 
   /** 单张贴图（用于开场动画方块等） */
-  tileCanvas(name: TileName): HTMLCanvasElement {
+  tileCanvas(name: string): HTMLCanvasElement {
     const c = document.createElement('canvas');
     c.width = c.height = TILE;
-    const [x, y] = this.pos.get(name)!;
+    const [x, y] = this.pos.get(name as TileName) ?? this.pos.get('stone')!;
     c.getContext('2d')!.drawImage(this.canvas, x, y, TILE, TILE, 0, 0, TILE, TILE);
     return c;
-  }
-
-  /** 等距视角方块图标（物品栏用），返回 dataURL */
-  icon(blockId: number, size = 64): string {
-    const cached = this.iconCache.get(blockId);
-    if (cached) return cached;
-    const def = BLOCKS[blockId];
-    const c = document.createElement('canvas');
-    c.width = c.height = size;
-    const ctx = c.getContext('2d')!;
-    ctx.imageSmoothingEnabled = false;
-    const s = size;
-    const k = 1 / TILE;
-    const face = (tile: TileName, shade: number) => {
-      const tmp = this.tileCanvas(tile);
-      const tc = tmp.getContext('2d')!;
-      if (shade > 0) {
-        tc.globalCompositeOperation = 'source-atop';
-        tc.fillStyle = `rgba(0,0,0,${shade})`;
-        tc.fillRect(0, 0, TILE, TILE);
-      }
-      return tmp;
-    };
-    const pad = s * 0.06;
-    const S = s - pad * 2;
-    ctx.translate(pad, pad);
-    // 顶面
-    ctx.setTransform((S / 2) * k, (-S / 4) * k, (S / 2) * k, (S / 4) * k, pad, pad + S / 4);
-    ctx.drawImage(face(def.tiles.top, 0), 0, 0);
-    // 左面
-    ctx.setTransform((S / 2) * k, (S / 4) * k, 0, (S / 2) * k, pad, pad + S / 4);
-    ctx.drawImage(face(def.tiles.side, 0.22), 0, 0);
-    // 右面
-    ctx.setTransform((S / 2) * k, (-S / 4) * k, 0, (S / 2) * k, pad + S / 2, pad + S / 2);
-    ctx.drawImage(face(def.tiles.side, 0.42), 0, 0);
-    const url = c.toDataURL();
-    this.iconCache.set(blockId, url);
-    return url;
   }
 
   /** 破坏裂纹（多个阶段） */

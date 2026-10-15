@@ -1,10 +1,11 @@
 import * as THREE from 'three';
 import { BLOCKS, B, IS_OPAQUE, RENDER_KIND } from './Blocks';
 import { CHUNK_X, CHUNK_Y, CHUNK_Z } from './Chunk';
-import type { TextureAtlas } from './TextureAtlas';
+import { LAYER } from './BlockTextures';
 
 /**
- * 区块网格化：合并几何 + 面剔除 + 逐顶点体素 AO（经典 3 邻居算法）+ 各向异性对角线翻转。
+ * 区块网格化：合并几何 + 面剔除 + 逐顶点体素 AO（经典 3 邻居算法）+ 各向异性对角线翻转
+ * + 平滑体素光照（方块光/天空光，按角点 4 格平均，Minecraft 式）。
  * 输入为带 1 格边距的方块数组（含相邻区块边界），输出三份几何：不透明 / 镂空（树叶、玻璃、植物）/ 水。
  * 热循环零分配：所有面常量预计算为扁平数组，顶点写入可增长的 TypedArray。
  */
@@ -64,7 +65,8 @@ class GeoBuilder {
   icount = 0;
   pos = new Float32Array(0);
   nor = new Float32Array(0);
-  uv = new Float32Array(0);
+  tex = new Float32Array(0);
+  light = new Float32Array(0);
   col = new Float32Array(0);
   extra = new Float32Array(0);
   index = new Uint32Array(0);
@@ -85,18 +87,20 @@ class GeoBuilder {
     };
     this.pos = grow(this.pos, 3);
     this.nor = grow(this.nor, 3);
-    this.uv = grow(this.uv, 2);
+    this.tex = grow(this.tex, 3);
+    this.light = grow(this.light, 2);
     this.col = grow(this.col, 3);
     this.extra = grow(this.extra, 1);
     this.index = grow(this.index, 1.5);
     this.cap = cap;
   }
 
-  vert(x: number, y: number, z: number, nx: number, ny: number, nz: number, u: number, v: number, c: number, e: number) {
+  vert(x: number, y: number, z: number, nx: number, ny: number, nz: number, u: number, v: number, layer: number, c: number, e: number, bl: number, sl: number) {
     const i = this.count++;
     this.pos[i * 3] = x; this.pos[i * 3 + 1] = y; this.pos[i * 3 + 2] = z;
     this.nor[i * 3] = nx; this.nor[i * 3 + 1] = ny; this.nor[i * 3 + 2] = nz;
-    this.uv[i * 2] = u; this.uv[i * 2 + 1] = v;
+    this.tex[i * 3] = u; this.tex[i * 3 + 1] = v; this.tex[i * 3 + 2] = layer;
+    this.light[i * 2] = bl; this.light[i * 2 + 1] = sl;
     this.col[i * 3] = c; this.col[i * 3 + 1] = c; this.col[i * 3 + 2] = c;
     this.extra[i] = e;
   }
@@ -120,7 +124,8 @@ class GeoBuilder {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(this.pos.slice(0, n * 3), 3));
     g.setAttribute('normal', new THREE.BufferAttribute(this.nor.slice(0, n * 3), 3));
-    g.setAttribute('uv', new THREE.BufferAttribute(this.uv.slice(0, n * 2), 2));
+    g.setAttribute('aTex', new THREE.BufferAttribute(this.tex.slice(0, n * 3), 3));
+    g.setAttribute('aLight', new THREE.BufferAttribute(this.light.slice(0, n * 2), 2));
     g.setAttribute('color', new THREE.BufferAttribute(this.col.slice(0, n * 3), 3));
     g.setAttribute(extraName, new THREE.BufferAttribute(this.extra.slice(0, n), 1));
     const idx = n > 65535 ? this.index.slice(0, this.icount) : Uint16Array.from(this.index.subarray(0, this.icount));
@@ -139,32 +144,26 @@ export interface MeshResult {
 
 // 复用的构建器
 const builders = { opaque: new GeoBuilder(), cutout: new GeoBuilder(), water: new GeoBuilder() };
-let UVTABLE: Float32Array | null = null; // [id*3+dir]*4 → u0 v0 u1 v1
+const LAYERTAB = new Float32Array(256 * 3); // [id*3+dir] → 纹理数组层
 const EMISSIVE = new Float32Array(256);
 const SWAY = new Float32Array(256);
-
-function uvTable(atlas: TextureAtlas) {
-  if (UVTABLE) return UVTABLE;
-  UVTABLE = new Float32Array(256 * 3 * 4);
-  for (const d of BLOCKS) {
-    if (!d) continue;
-    (['top', 'bottom', 'side'] as const).forEach((dir, di) => {
-      const r = atlas.uv(d.tiles[dir]);
-      UVTABLE!.set([r.u0, r.v0, r.u1, r.v1], (d.id * 3 + di) * 4);
-    });
-    EMISSIVE[d.id] = d.emissive;
-    SWAY[d.id] = d.sway;
-  }
-  return UVTABLE;
+for (const d of BLOCKS) {
+  if (!d) continue;
+  (['top', 'bottom', 'side'] as const).forEach((dir, di) => {
+    LAYERTAB[d.id * 3 + di] = LAYER[d.tiles[dir]];
+  });
+  EMISSIVE[d.id] = d.emissive;
+  SWAY[d.id] = d.sway;
 }
+const INV15 = 1 / 15;
 
 const CROSS = [
   [0.15, 0.15, 0.85, 0.85],
   [0.15, 0.85, 0.85, 0.15],
 ];
 
-export function meshChunk(p: Uint8Array, atlas: TextureAtlas): MeshResult {
-  const UV = uvTable(atlas);
+/** p：带 1 格边距的方块；blk/sky：同布局的方块光/天空光（0..15） */
+export function meshChunk(p: Uint8Array, blk: Uint8Array, sky: Uint8Array): MeshResult {
   const opaque = builders.opaque, cutout = builders.cutout, water = builders.water;
   opaque.reset(); cutout.reset(); water.reset();
   const ao = [0, 0, 0, 0];
@@ -179,16 +178,16 @@ export function meshChunk(p: Uint8Array, atlas: TextureAtlas): MeshResult {
 
         if (kind === 3) {
           // 十字植物（两片对角面片，顶点上沿随风摆动）
-          const o = (id * 3 + 2) * 4;
-          const u0 = UV[o], v0 = UV[o + 1], u1 = UV[o + 2], v1 = UV[o + 3];
+          const layer = LAYERTAB[id * 3 + 2];
           const sw = SWAY[id];
+          const bl = blk[i] * INV15, sl = sky[i] * INV15;
           cutout.ensure(8);
           for (const [ax, az, bx, bz] of CROSS) {
             const base = cutout.count;
-            cutout.vert(x + ax, y, z + az, 0, 1, 0, u0, v0, 1, 0);
-            cutout.vert(x + bx, y, z + bz, 0, 1, 0, u1, v0, 1, 0);
-            cutout.vert(x + bx, y + 0.9, z + bz, 0, 1, 0, u1, v1, 1, sw);
-            cutout.vert(x + ax, y + 0.9, z + az, 0, 1, 0, u0, v1, 1, sw);
+            cutout.vert(x + ax, y, z + az, 0, 1, 0, 0, 0, layer, 1, 0, bl, sl);
+            cutout.vert(x + bx, y, z + bz, 0, 1, 0, 1, 0, layer, 1, 0, bl, sl);
+            cutout.vert(x + bx, y + 0.9, z + bz, 0, 1, 0, 1, 1, layer, 1, sw, bl, sl);
+            cutout.vert(x + ax, y + 0.9, z + az, 0, 1, 0, 0, 1, layer, 1, sw, bl, sl);
             cutout.quad(base, false);
           }
           continue;
@@ -211,19 +210,23 @@ export function meshChunk(p: Uint8Array, atlas: TextureAtlas): MeshResult {
             if (f === 3 && nid !== B.AIR) continue;
           }
 
-          const o = (id * 3 + F_DIR[f]) * 4;
-          const u0 = UV[o], v0 = UV[o + 1], du = UV[o + 2] - u0, dv = UV[o + 3] - v0;
+          const layer = LAYERTAB[id * 3 + F_DIR[f]];
           const nx = F_NORMAL[f * 3], ny = F_NORMAL[f * 3 + 1], nz = F_NORMAL[f * 3 + 2];
           b.ensure(4);
           const base = b.count;
           for (let c = 0; c < 4; c++) {
             const co = (f * 4 + c) * 3;
             let a = 3;
+            let bsum = blk[ni], ssum = sky[ni], ln = 1;
             if (kind !== 4) {
-              const s1 = IS_OPAQUE[p[ni + C_AO[co]]];
-              const s2 = IS_OPAQUE[p[ni + C_AO[co + 1]]];
-              const cc = IS_OPAQUE[p[ni + C_AO[co + 2]]];
+              const o1 = ni + C_AO[co], o2 = ni + C_AO[co + 1], o3 = ni + C_AO[co + 2];
+              const s1 = IS_OPAQUE[p[o1]];
+              const s2 = IS_OPAQUE[p[o2]];
+              const cc = IS_OPAQUE[p[o3]];
               a = s1 && s2 ? 0 : 3 - (s1 + s2 + cc);
+              if (!s1) { bsum += blk[o1]; ssum += sky[o1]; ln++; }
+              if (!s2) { bsum += blk[o2]; ssum += sky[o2]; ln++; }
+              if (!cc && !(s1 && s2)) { bsum += blk[o3]; ssum += sky[o3]; ln++; }
             }
             ao[c] = a;
             let ly = C_LOCAL[co + 1];
@@ -233,8 +236,8 @@ export function meshChunk(p: Uint8Array, atlas: TextureAtlas): MeshResult {
             b.vert(
               x + C_LOCAL[co], y + ly, z + C_LOCAL[co + 2],
               nx, ny, nz,
-              u0 + du * C_TEX[to], v0 + dv * C_TEX[to + 1],
-              AO_CURVE[a], extra,
+              C_TEX[to], C_TEX[to + 1], layer,
+              AO_CURVE[a], extra, bsum * INV15 / ln, ssum * INV15 / ln,
             );
           }
           // 各向异性修正：AO 不对称时翻转对角线

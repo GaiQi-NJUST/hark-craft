@@ -17,7 +17,8 @@ export class Interaction {
   private crack: THREE.Mesh;
   private crackTex: THREE.CanvasTexture[];
   private crackMat: THREE.MeshBasicMaterial;
-  private progress = 0;
+  /** 当前破坏进度 0..1（UI 环形进度条读取） */
+  progress = 0;
   private progressKey = '';
   private cooldown = 0;
   private time = 0;
@@ -69,6 +70,7 @@ export class Interaction {
     player: PlayerController,
     selected: number,
     active: boolean,
+    showOutline = true,
     cb: { onBreak: (id: number, x: number, y: number, z: number) => void; onPlace: (id: number, x: number, y: number, z: number) => void },
   ) {
     this.time += dt;
@@ -80,7 +82,10 @@ export class Interaction {
       return;
     }
     camera.getWorldPosition(this.tmpO);
-    camera.getWorldDirection(this.tmpD);
+    if (input.aim) {
+      // 点击交互：从触摸点发射射线
+      this.tmpD.set(input.aim.x, input.aim.y, 0.5).unproject(camera).sub(this.tmpO).normalize();
+    } else camera.getWorldDirection(this.tmpD);
     const hit = raycastVoxel((x, y, z) => world.getBlock(x, y, z), this.tmpO, this.tmpD, this.reach);
     this.target = hit;
     if (!hit) {
@@ -88,7 +93,7 @@ export class Interaction {
       this.progress = 0;
       return;
     }
-    this.group.visible = true;
+    this.group.visible = showOutline;
     const isCross = BLOCKS[hit.id].render === 'cross';
     this.group.position.set(hit.x + 0.5, hit.y + (isCross ? 0.45 : 0.5), hit.z + 0.5);
     this.group.scale.set(isCross ? 0.72 : 1, isCross ? 0.9 : 1, isCross ? 0.72 : 1);

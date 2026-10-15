@@ -2,6 +2,78 @@ import * as THREE from 'three';
 import { Sky } from 'three/examples/jsm/objects/Sky.js';
 import type { Lighting } from './Lighting';
 import type { WaterMaterial } from '../fx/Water';
+import { blockUniforms } from '../world/BlockMaterial';
+import { sharedUniforms } from '../fx/Foliage';
+
+const CLOUD_VS = /* glsl */ `
+  varying vec3 vW;
+  void main() {
+    vec4 w = modelMatrix * vec4(position, 1.0);
+    vW = w.xyz;
+    gl_Position = projectionMatrix * viewMatrix * w;
+  }
+`;
+const CLOUD_FS = /* glsl */ `
+  uniform float uTime;
+  uniform vec3 uSunDir;
+  uniform vec3 uSunColor;
+  uniform vec3 uSkyCol;
+  uniform vec3 uHorizon;
+  uniform float uDay;
+  uniform float uNight;
+  uniform float uGolden;
+  uniform float uCover;
+  uniform vec3 uCam;
+  varying vec3 vW;
+  float h21(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+  float vn(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(h21(i), h21(i + vec2(1.0, 0.0)), f.x), mix(h21(i + vec2(0.0, 1.0)), h21(i + vec2(1.0, 1.0)), f.x), f.y);
+  }
+  float fbm(vec2 p) {
+    float s = 0.0, a = 0.5;
+    for (int i = 0; i < CLOUD_OCT; i++) { s += a * vn(p); p = p * 2.03 + vec2(1.7, 9.2); a *= 0.5; }
+    return s;
+  }
+  void main() {
+    vec2 p = vW.xz * 0.0055 + vec2(uTime * 0.0045, uTime * 0.0018);
+    float n = fbm(p);
+    float d = smoothstep(uCover, uCover + 0.22, n);
+    if (d < 0.003) discard;
+    float dist = length(vW.xz - uCam.xz);
+    float fade = 1.0 - smoothstep(420.0, 1250.0, dist);
+    // 朝太阳方向偏移采样 → 云体自阴影
+    float n2 = fbm(p + normalize(uSunDir.xz + 1e-4) * 0.05);
+    float shade = clamp(1.0 - (n2 - n) * 4.0, 0.35, 1.25);
+    vec3 V = normalize(vW - uCam);
+    float silver = pow(max(dot(V, uSunDir), 0.0), 8.0) * (1.0 - d) * 2.0;
+    vec3 base = mix(uSkyCol * 0.9 + vec3(0.18), vec3(1.0), 0.55);
+    vec3 lit = (base * shade + uSunColor * (0.35 * shade + silver)) * (0.15 + 0.85 * uDay);
+    lit = mix(lit, lit * vec3(1.15, 0.82, 0.62) + uSunColor * 0.25, uGolden * 0.6);
+    lit = mix(lit, vec3(0.05, 0.06, 0.1), uNight * 0.85);
+    lit = mix(uHorizon, lit, fade);
+    gl_FragColor = vec4(lit, d * fade * 0.92);
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+  }
+`;
+
+const ENV_VS = /* glsl */ `
+  varying vec3 vDir;
+  void main() { vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+`;
+const ENV_FS = /* glsl */ `
+  uniform vec3 uZenith; uniform vec3 uHorizon; uniform vec3 uGround; uniform vec3 uSunDir; uniform vec3 uSunColor; uniform float uSunVis;
+  varying vec3 vDir;
+  void main() {
+    vec3 d = normalize(vDir);
+    vec3 c = d.y > 0.0 ? mix(uHorizon, uZenith, pow(d.y, 0.55)) : mix(uHorizon, uGround, clamp(-d.y * 4.0, 0.0, 1.0));
+    float s = max(dot(d, normalize(uSunDir)), 0.0);
+    c += uSunColor * (pow(s, 600.0) * 40.0 + pow(s, 12.0) * 0.6) * uSunVis;
+    gl_FragColor = vec4(c, 1.0);
+  }
+`;
 
 /**
  * 昼夜循环（约 6 分钟一天，从日出开始）：three Sky 大气散射 + 星空 + 像素月亮，
@@ -79,8 +151,17 @@ export class SkySystem {
   };
   private tmpC = new THREE.Color();
   private tmpC2 = new THREE.Color();
+  readonly clouds: THREE.Mesh;
+  private cloudMat: THREE.ShaderMaterial;
+  private pmrem: THREE.PMREMGenerator;
+  private envScene = new THREE.Scene();
+  private envMat: THREE.ShaderMaterial;
+  private envRT: THREE.WebGLRenderTarget | null = null;
+  private envTod = -1;
+  private envStep = 0.008;
+  private cloudOct = 4;
 
-  constructor(scene: THREE.Scene) {
+  constructor(scene: THREE.Scene, renderer: THREE.WebGLRenderer) {
     this.sky = new Sky();
     this.sky.scale.setScalar(1400);
     // 扩展 Sky 着色器：白天整体增益（避免天空过曝发白）+ 夜晚蓝色调
@@ -158,7 +239,74 @@ export class SkySystem {
     this.moon.frustumCulled = false;
     this.group.add(this.moon);
 
+    // 云层：跟随相机的高空平面，fBm + 自阴影 + 银边
+    this.cloudMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uTime: sharedUniforms.uTime,
+        uSunDir: { value: new THREE.Vector3(0, 1, 0) },
+        uSunColor: { value: new THREE.Color(1, 1, 1) },
+        uSkyCol: { value: new THREE.Color(0.4, 0.6, 0.9) },
+        uHorizon: { value: new THREE.Color(0.8, 0.8, 0.8) },
+        uDay: { value: 1 },
+        uNight: { value: 0 },
+        uGolden: { value: 0 },
+        uCover: { value: 0.52 },
+        uCam: { value: new THREE.Vector3() },
+      },
+      defines: { CLOUD_OCT: 4 },
+      vertexShader: CLOUD_VS,
+      fragmentShader: CLOUD_FS,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      fog: false,
+    });
+    this.clouds = new THREE.Mesh(new THREE.PlaneGeometry(2800, 2800).rotateX(-Math.PI / 2), this.cloudMat);
+    this.clouds.frustumCulled = false;
+    this.clouds.renderOrder = -5;
+    scene.add(this.clouds);
+
+    // 天空环境光（PMREM）：给金属/湿润表面提供天空反射与漫反射环境光
+    this.pmrem = new THREE.PMREMGenerator(renderer);
+    this.envMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uZenith: { value: new THREE.Color() },
+        uHorizon: { value: new THREE.Color() },
+        uGround: { value: new THREE.Color() },
+        uSunDir: { value: new THREE.Vector3(0, 1, 0) },
+        uSunColor: { value: new THREE.Color() },
+        uSunVis: { value: 1 },
+      },
+      vertexShader: ENV_VS,
+      fragmentShader: ENV_FS,
+      side: THREE.BackSide,
+      depthWrite: false,
+    });
+    this.envScene.add(new THREE.Mesh(new THREE.SphereGeometry(50, 32, 16), this.envMat));
+
     scene.add(this.group);
+  }
+
+  /** 画质：云层倍频数（0 关闭）与环境光更新间隔 */
+  setQuality(cloudOctaves: number, envStep: number) {
+    this.envStep = envStep;
+    this.clouds.visible = cloudOctaves > 0;
+    if (cloudOctaves > 0 && cloudOctaves !== this.cloudOct) {
+      this.cloudOct = cloudOctaves;
+      this.cloudMat.defines.CLOUD_OCT = cloudOctaves;
+      this.cloudMat.needsUpdate = true;
+    }
+    this.envTod = -1;
+  }
+
+  private updateEnv(t: number, renderer: THREE.WebGLRenderer, scene: THREE.Scene) {
+    const dt = Math.abs(t - this.envTod);
+    if (this.envTod >= 0 && Math.min(dt, 1 - dt) < this.envStep) return;
+    this.envTod = t;
+    const old = this.envRT;
+    this.envRT = this.pmrem.fromScene(this.envScene, 0, 0.1, 100, { size: 64 });
+    scene.environment = this.envRT.texture;
+    old?.dispose();
   }
 
   sunDirFromTime(t: number, out = new THREE.Vector3()) {
@@ -229,9 +377,42 @@ export class SkySystem {
 
     lighting.hemi.color.copy(PALETTE.hemiDay).lerp(PALETTE.hemiGold, s.golden * 0.7).lerp(PALETTE.hemiNight, s.night);
     lighting.hemi.groundColor.copy(PALETTE.groundDay).lerp(PALETTE.groundNight, s.night);
-    lighting.hemi.intensity = 0.45 + 0.75 * s.daylight + s.night * 0.35;
+    lighting.hemi.intensity = 0.35 + 0.85 * s.daylight + s.night * 0.08;
 
-    renderer.toneMappingExposure = 0.7 + s.night * 0.35 + s.golden * 0.1;
+    renderer.toneMappingExposure = 0.72 + s.night * 0.18 + s.golden * 0.1;
+
+    // 天空颜色（天顶）
+    const zenith = this.tmpC.copy(PALETTE.zenithDay).lerp(PALETTE.zenithGold, s.golden).lerp(PALETTE.zenithNight, s.night);
+
+    // 云层
+    const cu = this.cloudMat.uniforms;
+    cu.uSunDir.value.copy(el > -0.03 ? s.sunDir : moonDir);
+    cu.uSunColor.value.copy(el > -0.03 ? sunCol : PALETTE.moon).multiplyScalar(el > -0.03 ? 1 : 0.3);
+    cu.uSkyCol.value.copy(zenith);
+    cu.uHorizon.value.copy(fog);
+    cu.uDay.value = s.daylight;
+    cu.uNight.value = s.night;
+    cu.uGolden.value = s.golden;
+    cu.uCam.value.copy(camera.position);
+    this.clouds.position.set(camera.position.x, 118, camera.position.z);
+
+    // 环境光照（PMREM）：天顶/地平线/地面 + 太阳
+    const eu = this.envMat.uniforms;
+    eu.uZenith.value.copy(zenith).multiplyScalar(1.1);
+    eu.uHorizon.value.copy(fog).multiplyScalar(0.9);
+    eu.uGround.value.copy(PALETTE.groundDay).lerp(PALETTE.groundNight, s.night).multiplyScalar(0.6);
+    eu.uSunDir.value.copy(el > -0.03 ? s.sunDir : moonDir);
+    eu.uSunColor.value.copy(el > -0.03 ? sunCol : PALETTE.moon);
+    eu.uSunVis.value = el > -0.03 ? smooth(-0.03, 0.12, el) : 0.15 * s.night;
+    this.updateEnv(t, renderer, scene);
+    scene.environmentIntensity = 0.35 + 0.85 * s.daylight;
+    lighting.hemi.intensity *= 0.8;
+
+    // 方块材质：日出湿润高光、晨雾（高度雾）、低处雾色
+    const morning = t > 0.85 || t < 0.3 ? 1 : 0.35;
+    blockUniforms.uWet.value = Math.min(1, s.golden * 1.4) * morning;
+    blockUniforms.uHeightFog.value = 0.06 + s.golden * 0.32 * morning + s.night * 0.08;
+    blockUniforms.uFogColorLow.value.copy(fog).lerp(sunCol, s.golden * 0.25 * s.daylight).multiplyScalar(1.05);
 
     if (water) {
       const wu = water.uniforms;
@@ -239,8 +420,7 @@ export class SkySystem {
       wu.uSunColor.value.copy(el > -0.03 ? sunCol : PALETTE.moon);
       wu.uSunVis.value = el > -0.03 ? smooth(-0.03, 0.1, el) : 0.25 * s.night;
       wu.uHorizon.value.copy(fog);
-      this.tmpC.copy(PALETTE.zenithDay).lerp(PALETTE.zenithGold, s.golden).lerp(PALETTE.zenithNight, s.night);
-      wu.uSky.value.copy(this.tmpC);
+      wu.uSky.value.copy(zenith);
       wu.uDaylight.value = s.daylight;
       wu.fogColor.value.copy(fog);
     }

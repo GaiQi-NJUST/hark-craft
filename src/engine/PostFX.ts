@@ -5,11 +5,14 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js';
+import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
+import { FXAAPass } from 'three/examples/jsm/postprocessing/FXAAPass.js';
 import type { QualitySettings } from './Quality';
 
 /**
  * 后处理链（线性 HDR → 色调映射 → 显示空间调色）：
- * RenderPass → GTAO(SSAO，仅高画质) → UnrealBloom → 径向体积光(God Rays) → OutputPass(ACES+sRGB) → 调色/暗角/胶片颗粒
+ * RenderPass → GTAO(SSAO，仅高画质) → UnrealBloom → 径向体积光(God Rays) → OutputPass(ACES+sRGB)
+ * → SMAA(高) / FXAA(中) → 调色/暗角/胶片颗粒
  */
 
 const GodRayShader = {
@@ -122,6 +125,8 @@ export class PostFX {
   readonly bloom: UnrealBloomPass;
   readonly godRays: ShaderPass;
   readonly output: OutputPass;
+  readonly smaa: SMAAPass;
+  readonly fxaa: FXAAPass;
   readonly grade: ShaderPass;
   private renderer: THREE.WebGLRenderer;
   private ssaoWanted = false;
@@ -158,6 +163,13 @@ export class PostFX {
     this.output = new OutputPass();
     this.composer.addPass(this.output);
 
+    this.smaa = new SMAAPass();
+    this.smaa.enabled = false;
+    this.composer.addPass(this.smaa);
+    this.fxaa = new FXAAPass();
+    this.fxaa.enabled = false;
+    this.composer.addPass(this.fxaa);
+
     this.grade = new ShaderPass(GradeShader);
     this.composer.addPass(this.grade);
   }
@@ -175,6 +187,8 @@ export class PostFX {
     this.gtao.enabled = q.ssao && allowSSAO;
     this.raysWanted = q.godRays;
     this.bloom.enabled = q.bloom;
+    this.smaa.enabled = q.aa === 'smaa';
+    this.fxaa.enabled = q.aa === 'fxaa';
     if (this.samples !== q.godRaySamples) {
       this.samples = q.godRaySamples;
       const m = this.godRays.material as THREE.ShaderMaterial;

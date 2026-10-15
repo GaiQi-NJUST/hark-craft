@@ -5,7 +5,9 @@ import { PostFX } from './PostFX';
 import { Lighting } from './Lighting';
 import { SkySystem, DAY_LENGTH_SEC } from './SkySystem';
 import { World } from '../world/World';
-import { BLOCKS, HOTBAR } from '../world/Blocks';
+import { BLOCKS } from '../world/Blocks';
+import { getBlockTextures, TEX_LABEL, type BlockTextures, type BlockTexSet } from '../world/BlockTextures';
+import { blockUniforms } from '../world/BlockMaterial';
 import { BIOME_ZH } from '../world/TerrainGen';
 import { PlayerController } from '../player/PlayerController';
 import { input } from '../player/Input';
@@ -42,6 +44,7 @@ export class Engine {
   readonly ambient: AmbientParticles;
   readonly post: PostFX;
   readonly splash: SplashScene;
+  readonly textures: BlockTextures;
   /** 输入系统（暴露给调试/自动化测试） */
   readonly input = input;
 
@@ -74,6 +77,18 @@ export class Engine {
   private pendingSafeSpawn = false;
   /** ?budget=ms：覆盖每帧区块生成预算（无头测试用） */
   private budgetOverride = 0;
+  /** 自适应分辨率 */
+  private adaptive = true;
+  private dynPR = 1;
+  private perfT = 0;
+  private perfFrames = 0;
+  private perfCooldown = 0;
+  private texUiTimer = 0;
+  /** 打开物品栏时退出指针锁定，不触发暂停 */
+  private suppressUnlockPause = false;
+  private lastSpace = 0;
+  /** ?instant：跳过进入游戏的镜头过渡（无头测试） */
+  private instantEnter = false;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -81,6 +96,7 @@ export class Engine {
     this.quality = getQuality(st.quality);
 
     this.renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false });
+    this.dynPR = this.quality.pixelRatio;
     this.renderer.setPixelRatio(this.quality.pixelRatio);
     this.renderer.setSize(container.clientWidth, container.clientHeight);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -95,9 +111,15 @@ export class Engine {
     this.camera = new THREE.PerspectiveCamera(72, container.clientWidth / container.clientHeight, 0.08, 1600);
     this.scene.fog = new THREE.Fog(0xa9c6e6, 60, 120);
 
+    // 材质包：64x 基础版同步生成，高清版分帧渐进生成
+    this.textures = getBlockTextures();
+    this.textures.setAnisotropy(Math.min(st.isTouch ? 4 : 8, this.renderer.capabilities.getMaxAnisotropy()));
+    this.textures.onChange = (set) => this.applyTextures(set);
+    this.textures.request(st.texRes <= 64 ? st.texRes : 64);
+    if (st.texRes > 64) this.textures.request(st.texRes);
     this.world = new World(st.worldSeed);
     this.scene.add(this.world.group);
-    this.sky = new SkySystem(this.scene);
+    this.sky = new SkySystem(this.scene, this.renderer);
     this.lighting = new Lighting(this.scene);
     this.interaction = new Interaction(this.scene);
     this.burst = new BlockBurst(this.scene);
@@ -115,7 +137,12 @@ export class Engine {
     input.attach(this.renderer.domElement);
     input.onKey = this.handleKey;
     input.onUnlock = () => {
-      if (useGame.getState().scene === 'playing') this.pause();
+      if (this.suppressUnlockPause) {
+        this.suppressUnlockPause = false;
+        return;
+      }
+      const s = useGame.getState();
+      if (s.scene === 'playing' && !s.inventoryOpen) this.pause();
     };
     input.onLockError = () => {
       useGame.getState().setPointerLockSupported(false);
@@ -135,6 +162,11 @@ export class Engine {
       useGame.subscribe((s, prev) => {
         if (s.quality !== prev.quality) this.applyQuality(s.quality);
         if (s.muted !== prev.muted) synth.setMuted(s.muted);
+        if (s.texRes !== prev.texRes) {
+          this.textures.request(s.texRes);
+          s.showToast(this.textures.pendingRes ? `材质包：${TEX_LABEL[s.texRes]} 生成中…` : `材质包：${TEX_LABEL[s.texRes]}`);
+        }
+        if (s.inventoryOpen !== prev.inventoryOpen) this.onInventory(s.inventoryOpen);
       }),
     );
 
@@ -142,10 +174,14 @@ export class Engine {
     this.autoplay = params.has('autoplay');
     this.fixedStep = params.has('fixedStep');
     this.budgetOverride = Number(params.get('budget')) || 0;
+    this.adaptive = !this.fixedStep && !params.has('noAdaptive');
+    this.instantEnter = params.has('instant');
+    if (params.has('texSync')) this.textures.finish();
     if (params.has('skipIntro') || this.autoplay) this.skipIntro();
     if (params.has('time')) this.tod = parseFloat(params.get('time')!) || TITLE_TIME;
 
-    (window as unknown as { __hark: Engine }).__hark = this;
+    (window as unknown as { __hark: Engine; __harkStore: typeof useGame }).__hark = this;
+    (window as unknown as { __harkStore: typeof useGame }).__harkStore = useGame;
     this.raf = requestAnimationFrame(this.loop);
   }
 
@@ -183,7 +219,7 @@ export class Engine {
     this.player.pitch = -0.12;
     this.enterFrom.pos.copy(this.camera.position);
     this.enterFrom.quat.copy(this.camera.quaternion);
-    this.enterT = 0;
+    this.enterT = this.instantEnter ? ENTER_DURATION : 0;
     st.setEntering(true);
     st.setScene('playing');
     if (!st.isTouch) input.requestLock();
@@ -206,6 +242,48 @@ export class Engine {
     input.breakHeld = false;
     this.pausedAt = performance.now();
     st.setScene('paused');
+  }
+
+  /** 切换飞行（F 键 / 双击跳跃） */
+  toggleFly() {
+    const st = useGame.getState();
+    this.player.flying = !this.player.flying;
+    this.player.velocity.y = 0;
+    st.setFlying(this.player.flying);
+    synth.pop('ui');
+    st.showToast(this.player.flying ? (st.isTouch ? '飞行模式：开（▲ 上升 / ▼ 下降）' : '飞行模式：开（空格上升 / Shift 下降）') : '飞行模式：关');
+  }
+
+  openInventory(open: boolean) {
+    const st = useGame.getState();
+    if (open && st.scene !== 'playing') return;
+    st.setInventoryOpen(open);
+  }
+
+  private onInventory(open: boolean) {
+    const st = useGame.getState();
+    synth.pop('ui');
+    input.breakHeld = false;
+    input.touchBreak = false;
+    if (open) {
+      input.enabled = false;
+      if (input.locked) {
+        this.suppressUnlockPause = true;
+        input.exitLock();
+      }
+    } else if (st.scene === 'playing') {
+      input.enabled = true;
+      if (!st.isTouch) input.requestLock();
+    }
+  }
+
+  private applyTextures(set: BlockTexSet) {
+    blockUniforms.uAlb.value = set.albedo;
+    blockUniforms.uNrm.value = set.normal;
+    blockUniforms.uMer.value = set.mer;
+    blockUniforms.uPBR.value = set.pbr ? 1 : 0;
+    blockUniforms.uTexSize.value = set.res;
+    useGame.getState().setTexProgress(1, this.textures.version);
   }
 
   regenerateWorld() {
@@ -234,9 +312,13 @@ export class Engine {
   private applyQuality(tier: QualityTier) {
     const q = getQuality(tier);
     this.quality = q;
+    this.dynPR = q.pixelRatio;
     this.renderer.setPixelRatio(q.pixelRatio);
     this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
     this.lighting.configureShadow(q.shadowMapSize, q.shadowExtent);
+    this.world.setPCSS(q.pcss);
+    this.world.setShadowRadius(q.shadowExtent);
+    this.sky.setQuality(q.cloudOctaves, q.envStep);
     this.world.setRenderDistance(q.renderDistance);
     const fog = this.scene.fog as THREE.Fog;
     fog.far = q.renderDistance * 16 - 4;
@@ -272,10 +354,22 @@ export class Engine {
     if (st.scene === 'playing') {
       if (code === 'Escape' && !input.locked) this.pause();
       if (code === 'F3') st.toggleDebug();
-      if (code === 'KeyF') {
-        this.player.flying = !this.player.flying;
-        this.player.velocity.y = 0;
-        st.showToast(this.player.flying ? '飞行模式：开（空格上升 / Shift 下降）' : '飞行模式：关');
+      if (code === 'KeyE') {
+        this.openInventory(!st.inventoryOpen);
+        return;
+      }
+      if (st.inventoryOpen) {
+        if (code === 'Escape') this.openInventory(false);
+        return;
+      }
+      if (code === 'KeyF') this.toggleFly();
+      if (code === 'Space') {
+        // 双击空格切换飞行（Java 版习惯）
+        const now = performance.now();
+        if (now - this.lastSpace < 300) {
+          this.toggleFly();
+          this.lastSpace = 0;
+        } else this.lastSpace = now;
       }
       if (code.startsWith('Digit')) {
         const n = parseInt(code.slice(5), 10);
@@ -308,6 +402,16 @@ export class Engine {
 
     const st = useGame.getState();
     synth.update(dt);
+
+    // 材质包渐进生成（开场动画期间预算更多）
+    if (this.textures.pendingRes) {
+      this.textures.step(this.phase === 'intro' ? 12 : 5);
+      this.texUiTimer += realDt;
+      if (this.texUiTimer > 0.3 && this.textures.pendingRes) {
+        this.texUiTimer = 0;
+        st.setTexProgress(this.textures.progress);
+      }
+    }
 
     if (this.phase === 'intro') {
       this.phaseT += dt;
@@ -379,26 +483,32 @@ export class Engine {
           st.setEntering(false);
         }
       } else {
-        input.enabled = true;
-        if (input.wheel !== 0) st.setSlot(st.selectedSlot + input.wheel);
-        this.player.update(dt, input, this.world, this.camera, true);
+        input.enabled = !st.inventoryOpen;
+        if (input.wheel !== 0 && !st.inventoryOpen) st.setSlot(st.selectedSlot + input.wheel);
+        this.player.update(dt, input, this.world, this.camera, !st.inventoryOpen);
+        if (this.player.flying !== st.flying) st.setFlying(this.player.flying);
+        if (this.player.sneaking !== st.sneaking) st.setSneaking(this.player.sneaking);
       }
-      const selected = HOTBAR[useGame.getState().selectedSlot];
-      this.interaction.update(dt, this.camera, this.world, input, this.player, selected, this.enterT < 0, {
+      const gs = useGame.getState();
+      const selected = gs.hotbar[gs.selectedSlot];
+      const tapMode = gs.isTouch && gs.interactMode === 'tap';
+      this.interaction.update(dt, this.camera, this.world, input, this.player, selected, this.enterT < 0 && !gs.inventoryOpen && (!tapMode || input.aim !== null), !tapMode || input.aimActive, {
         onBreak: (id, x, y, z) => {
           this.burst.emit(x, y, z, BLOCKS[id].particle, 26, BLOCKS[id].emissive > 1 ? 1.5 : 0);
           synth.pop('break', 0.8 + Math.random() * 0.4);
         },
         onPlace: () => synth.pop('place', 0.9 + Math.random() * 0.2),
       });
+      if (!input.aimActive) input.aim = null;
       this.updateWorld(dt, this.player.position, true, this.quality.genBudgetMs);
+      this.adaptResolution(realDt);
       if (this.pendingSafeSpawn && this.world.isMeshed(Math.floor(this.spawn.x), Math.floor(this.spawn.z))) {
         this.pendingSafeSpawn = false;
         this.player.spawn(this.world.findSafeSpot(this.spawn.x, this.spawn.z));
       }
     } else {
       // paused
-      this.interaction.update(dt, this.camera, this.world, input, this.player, 0, false, { onBreak: () => {}, onPlace: () => {} });
+      this.interaction.update(dt, this.camera, this.world, input, this.player, 0, false, false, { onBreak: () => {}, onPlace: () => {} });
       this.updateWorld(0, this.player.position, true, 3);
     }
 
@@ -425,10 +535,36 @@ export class Engine {
           triangles: this.renderer.info.render.triangles,
           facing: `${facing} · ${BIOME_ZH[this.world.gen.biomeAt(p.x, p.z)]}`,
           flying: this.player.flying,
+          pixelRatio: this.renderer.getPixelRatio(),
+          tex: TEX_LABEL[this.textures.current?.res ?? 64] + (this.textures.pendingRes ? ` → ${this.textures.pendingRes}x ${Math.round(this.textures.progress * 100)}%` : ''),
         });
       }
     }
   };
+
+  /** 自适应分辨率：持续掉帧时降低像素比，余量充足时回升 */
+  private adaptResolution(realDt: number) {
+    if (!this.adaptive) return;
+    this.perfT += realDt;
+    this.perfFrames++;
+    this.perfCooldown = Math.max(0, this.perfCooldown - realDt);
+    if (this.perfT < 2) return;
+    const fps = this.perfFrames / this.perfT;
+    this.perfT = 0;
+    this.perfFrames = 0;
+    if (this.perfCooldown > 0) return;
+    const q = this.quality;
+    let pr = this.dynPR;
+    if (fps < 45 && pr > q.minPixelRatio + 0.01) pr = Math.max(q.minPixelRatio, pr - 0.15);
+    else if (fps > 58 && pr < q.pixelRatio - 0.01) pr = Math.min(q.pixelRatio, pr + 0.1);
+    if (pr !== this.dynPR) {
+      this.dynPR = pr;
+      this.renderer.setPixelRatio(pr);
+      this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
+      this.post.setSize(this.container.clientWidth, this.container.clientHeight);
+      this.perfCooldown = 4;
+    }
+  }
 
   /** 标题镜头朝向太阳（逆光 + 体积光），并缓慢左右摇摆 */
   private sunFacingAngle() {

@@ -18,6 +18,8 @@ export class Chunk {
   /** 每列最高的非空气方块（用于萤火虫/出生点等） */
   readonly heightMap = new Uint8Array(CHUNK_X * CHUNK_Z);
   generated = false;
+  /** 区块内光源方块数量（为 0 时可跳过方块光计算） */
+  lightCount = 0;
   dirty = true;
   meshes: { opaque?: THREE.Mesh; cutout?: THREE.Mesh; water?: THREE.Mesh } = {};
 

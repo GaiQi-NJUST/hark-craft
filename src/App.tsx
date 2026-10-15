@@ -7,6 +7,7 @@ import { HUD } from './ui/HUD';
 import { PauseMenu } from './ui/PauseMenu';
 import { TouchControls } from './ui/TouchControls';
 import { HelpPanel } from './ui/HelpPanel';
+import { Inventory } from './ui/Inventory';
 
 /**
  * 场景状态机：splash → title → playing ⇄ paused
@@ -39,8 +40,9 @@ export default function App() {
       {error && <div className="fatal glass-panel">{error}</div>}
       <div className={'layer fade-layer' + (scene === 'splash' ? ' on' : '')}>{scene === 'splash' && <SplashOverlay engine={engine} />}</div>
       <div className={'layer fade-layer' + (scene === 'title' ? ' on' : '')}>{scene === 'title' && <TitleScreen engine={engine} />}</div>
-      <HUD />
+      <HUD engine={engine} />
       {isTouch && scene === 'playing' && !entering && <TouchControls engine={engine} />}
+      {scene === 'playing' && <Inventory />}
       <div className={'layer fade-layer' + (scene === 'paused' ? ' on' : '')}>{scene === 'paused' && <PauseMenu engine={engine} />}</div>
       <HelpPanel />
     </div>

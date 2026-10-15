@@ -1,11 +1,11 @@
 import * as THREE from 'three';
-import { B, IS_OPAQUE, IS_SOLID } from './Blocks';
+import { B, IS_OPAQUE, IS_SOLID, LIGHT_EMIT } from './Blocks';
 import { Chunk, chunkKey, CHUNK_X, CHUNK_Y, CHUNK_Z, idx } from './Chunk';
 import { meshChunk, PX, PY, PZ } from './ChunkMesher';
 import { TerrainGen, SEA_LEVEL } from './TerrainGen';
-import { getAtlas, type TextureAtlas } from './TextureAtlas';
-import { createCutoutDepthMaterial, createCutoutMaterial, createOpaqueMaterial } from '../fx/Foliage';
+import { createBlockMaterial, createCutoutDepthMaterial, setPCSS } from './BlockMaterial';
 import { createWaterMaterial, type WaterMaterial } from '../fx/Water';
+import { computeSkyLight, computeBlockLight } from './Light';
 
 /**
  * 区块管理器：按距离排序的增量生成（每帧时间预算）、卸载远处区块、
@@ -13,7 +13,6 @@ import { createWaterMaterial, type WaterMaterial } from '../fx/Water';
  */
 export class World {
   readonly group = new THREE.Group();
-  readonly atlas: TextureAtlas;
   readonly materials: {
     opaque: THREE.MeshStandardMaterial;
     cutout: THREE.MeshStandardMaterial;
@@ -29,19 +28,30 @@ export class World {
   private order: [number, number, number][] = [];
   private centerKey = '';
   private padded = new Uint8Array(PX * PY * PZ);
+  private blkP = new Uint8Array(PX * PY * PZ);
+  private skyP = new Uint8Array(PX * PY * PZ);
   private lastChunk: Chunk | null = null;
   meshedCount = 0;
+  /** 只有阴影范围内的区块投射阴影（阴影 pass 绘制调用预算） */
+  private shadowR = 3.2;
+  private scx = 0;
+  private scz = 0;
 
   constructor(seed: number) {
-    this.atlas = getAtlas();
     this.gen = new TerrainGen(seed);
     this.materials = {
-      opaque: createOpaqueMaterial(this.atlas.texture),
-      cutout: createCutoutMaterial(this.atlas.texture),
-      cutoutDepth: createCutoutDepthMaterial(this.atlas.texture),
+      opaque: createBlockMaterial('opaque', false),
+      cutout: createBlockMaterial('cutout', false),
+      cutoutDepth: createCutoutDepthMaterial(),
       water: createWaterMaterial(),
     };
     this.group.name = 'world';
+  }
+
+  /** 高画质：PCSS 软阴影 */
+  setPCSS(on: boolean) {
+    setPCSS(this.materials.opaque, on);
+    setPCSS(this.materials.cutout, on);
   }
 
   get chunkCount() {
@@ -58,6 +68,23 @@ export class World {
     this.lastChunk = null;
     this.meshedCount = 0;
     this.gen = new TerrainGen(seed);
+  }
+
+  setShadowRadius(blocks: number) {
+    this.shadowR = blocks / CHUNK_X + 0.3;
+    this.refreshShadowCasters();
+  }
+
+  private castsShadow(c: Chunk) {
+    return Math.hypot(c.cx - this.scx, c.cz - this.scz) <= this.shadowR;
+  }
+
+  private refreshShadowCasters() {
+    for (const c of this.chunks.values()) {
+      const on = this.castsShadow(c);
+      if (c.meshes.opaque) c.meshes.opaque.castShadow = on;
+      if (c.meshes.cutout) c.meshes.cutout.castShadow = on;
+    }
   }
 
   setRenderDistance(r: number) {
@@ -147,8 +174,10 @@ export class World {
     if (!c || !c.generated) return false;
     const lx = wx - cx * CHUNK_X, lz = wz - cz * CHUNK_Z;
     const i = idx(lx, wy, lz);
-    if (c.data[i] === id) return false;
+    const old = c.data[i];
+    if (old === id) return false;
     c.data[i] = id;
+    c.lightCount += (LIGHT_EMIT[id] ? 1 : 0) - (LIGHT_EMIT[old] ? 1 : 0);
     c.recomputeHeight(lx, lz);
     let e = this.edits.get(c.key);
     if (!e) this.edits.set(c.key, (e = new Map()));
@@ -167,6 +196,10 @@ export class World {
     if (bx) mark(cx + bx, cz);
     if (bz) mark(cx, cz + bz);
     if (bx && bz) mark(cx + bx, cz + bz);
+    if (LIGHT_EMIT[old] || LIGHT_EMIT[id]) {
+      // 光源变化：光照最多传播 14 格，重建周围 3×3 区块
+      for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) mark(cx + dx, cz + dz);
+    }
     return true;
   }
 
@@ -210,6 +243,10 @@ export class World {
       for (const [i, id] of e) c.data[i] = id;
       for (let z = 0; z < CHUNK_Z; z++) for (let x = 0; x < CHUNK_X; x++) c.recomputeHeight(x, z);
     }
+    let lc = 0;
+    const d = c.data;
+    for (let k = 0; k < d.length; k++) if (LIGHT_EMIT[d[k]]) lc++;
+    c.lightCount = lc;
     this.chunks.set(c.key, c);
   }
 
@@ -220,6 +257,9 @@ export class World {
     if (key !== this.centerKey) {
       this.centerKey = key;
       this.rebuildOrder(ccx, ccz);
+      this.scx = ccx;
+      this.scz = ccz;
+      this.refreshShadowCasters();
     }
 
     // 编辑过的区块立即重建（不受预算限制）
@@ -301,13 +341,25 @@ export class World {
 
   private buildMesh(c: Chunk) {
     this.fillPadded(c);
-    const res = meshChunk(this.padded, this.atlas);
+    computeSkyLight(this.padded, this.skyP);
+    const nb: (Chunk | undefined)[] = [];
+    let anyLight = false;
+    for (let dz = -1; dz <= 1; dz++)
+      for (let dx = -1; dx <= 1; dx++) {
+        const n = this.getChunk(c.cx + dx, c.cz + dz);
+        nb.push(n);
+        if (n && n.lightCount > 0) anyLight = true;
+      }
+    if (anyLight) computeBlockLight(nb, this.blkP);
+    else this.blkP.fill(0);
+    const res = meshChunk(this.padded, this.blkP, this.skyP);
     const wasMeshed = !c.dirty || Object.keys(c.meshes).length > 0;
     this.disposeMeshes(c);
     const ox = c.cx * CHUNK_X, oz = c.cz * CHUNK_Z;
     if (res.opaque) {
       const m = new THREE.Mesh(res.opaque, this.materials.opaque);
-      m.castShadow = m.receiveShadow = true;
+      m.receiveShadow = true;
+      m.castShadow = this.castsShadow(c);
       m.position.set(ox, 0, oz);
       m.matrixAutoUpdate = false;
       m.updateMatrix();
@@ -316,7 +368,8 @@ export class World {
     }
     if (res.cutout) {
       const m = new THREE.Mesh(res.cutout, this.materials.cutout);
-      m.castShadow = m.receiveShadow = true;
+      m.receiveShadow = true;
+      m.castShadow = this.castsShadow(c);
       m.customDepthMaterial = this.materials.cutoutDepth;
       m.position.set(ox, 0, oz);
       m.matrixAutoUpdate = false;

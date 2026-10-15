@@ -68,6 +68,8 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon --stacktrace
+      - name: Read version
+        run: echo "VER=$(node -p "require('./package.json').version")" >> "$GITHUB_ENV"
       - name: Collect APK
         run: |
           cp android/app/build/outputs/apk/debug/app-debug.apk HarkCraft.apk
@@ -77,13 +79,17 @@ jobs:
         with:
           name: HarkCraft-apk
           path: HarkCraft.apk
-      - name: Publish Release v1.0.0
+      - name: Publish Release v${{ env.VER }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0
-          name: HARK CRAFT v1.0.0
+          tag_name: v${{ env.VER }}
+          name: HARK CRAFT v${{ env.VER }}
           body: |
-            HARK CRAFT 安卓版（调试签名，可直接安装）。
-            下载 HarkCraft.apk，在手机上允许"安装未知来源应用"后安装即可。横屏全屏运行，支持触屏操作。
+            HARK CRAFT 安卓版 v${{ env.VER }}（可直接侧载安装）。
+            ⚠ 从 v1.0.0 升级：v1.0.0 使用了 CI 随机调试签名，请先卸载旧版再安装；从 v1.1.0 起使用固定签名，以后可直接覆盖升级。
+            新内容：基岩版触屏布局（摇杆 / 跳跃 / 潜行 / 飞行 / 点击交互）、修复快捷栏点按切换、
+            创造物品栏（38 种方块，4 个分类）、程序化 PBR 材质包（高清 256x / 128x / 64x / 像素 16x）、
+            方块光照（荧石 / 灯笼 / 海晶灯照亮夜晚）、PCSS 软阴影、云层、天空环境反射、日出湿润高光、晨雾、SMAA/FXAA。
+            下载 HarkCraft.apk，在手机上允许"安装未知来源应用"后安装即可。
           files: HarkCraft.apk
           make_latest: true

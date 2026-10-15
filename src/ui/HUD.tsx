@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useGame } from '../store';
 import { SkySystem } from '../engine/SkySystem';
 import { Hotbar } from './Hotbar';
+import type { Engine } from '../engine/Engine';
 
 function TimeIndicator() {
   const t = useGame((s) => s.timeOfDay);
@@ -41,7 +42,8 @@ function DebugPanel() {
       <div>朝向：{d.facing}</div>
       <div>区块：{d.chunks} · 绘制调用：{d.drawCalls}</div>
       <div>三角形：{(d.triangles / 1000).toFixed(0)}k · 画质：{q}</div>
-      <div>飞行：{d.flying ? '开' : '关'}</div>
+      <div>飞行：{d.flying ? '开' : '关'} · 像素比：{d.pixelRatio.toFixed(2)}</div>
+      <div>材质包：{d.tex}</div>
     </div>
   );
 }
@@ -59,10 +61,24 @@ function Toast() {
   return <div className={'toast glass-chip' + (visible ? ' show' : '')}>{toast.text}</div>;
 }
 
-export function HUD() {
+function TexProgress() {
+  const p = useGame((s) => s.texProgress);
+  if (p >= 1) return null;
+  return (
+    <div className="tex-progress glass-chip">
+      材质包生成中 {Math.round(p * 100)}%
+      <span className="tex-bar"><i style={{ width: `${p * 100}%` }} /></span>
+    </div>
+  );
+}
+
+export function HUD({ engine }: { engine: Engine | null }) {
   const scene = useGame((s) => s.scene);
   const entering = useGame((s) => s.entering);
   const isTouch = useGame((s) => s.isTouch);
+  const mode = useGame((s) => s.interactMode);
+  const toggleDebug = useGame((s) => s.toggleDebug);
+  const inv = useGame((s) => s.inventoryOpen);
   const [tips, setTips] = useState(true);
   useEffect(() => {
     const id = setTimeout(() => setTips(false), 7000);
@@ -70,18 +86,31 @@ export function HUD() {
   }, []);
   const active = scene === 'playing' || scene === 'paused';
   return (
-    <div className={'hud' + (active && !entering ? ' visible' : '')}>
-      <div className="crosshair">
-        <span />
-        <span />
-      </div>
-      <div className="hud-top-left">
+    <div className={'hud' + (active && !entering ? ' visible' : '') + (isTouch ? ' touch' : '') + (inv ? ' inv-open' : '')}>
+      {!(isTouch && mode === 'tap') && (
+        <div className="crosshair">
+          <span />
+          <span />
+        </div>
+      )}
+      {isTouch && (
+        <button className="hud-btn hud-pause" aria-label="暂停" onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); engine?.pause(); }}>
+          <span className="burger"><i /><i /><i /></span>
+        </button>
+      )}
+      <div className="hud-top-right">
         <TimeIndicator />
+        {isTouch && (
+          <button className="hud-btn hud-f3" aria-label="F3 调试" onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); toggleDebug(); }}>
+            F3
+          </button>
+        )}
       </div>
       <DebugPanel />
       <Toast />
+      <TexProgress />
       {tips && !isTouch && scene === 'playing' && !entering && (
-        <div className="tips glass-chip">WASD 移动 · 空格跳跃 · 左键破坏 · 右键放置 · F 飞行 · T 快进时间 · Esc 暂停</div>
+        <div className="tips glass-chip">WASD 移动 · 空格跳跃（双击飞行）· 左键破坏 · 右键放置 · E 物品栏 · Ctrl 潜行 · T 快进 · Esc 暂停</div>
       )}
       <Hotbar />
     </div>
